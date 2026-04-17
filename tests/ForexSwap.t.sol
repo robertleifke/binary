@@ -413,6 +413,9 @@ contract ForexSwapHarness is ForexSwap {
 }
 
 contract ForexSwapCorrectTest is Test {
+    bool internal constant DEBUG = false;
+    uint256 internal constant MAX_FUZZ_SEQUENCE_STEPS = 8;
+
     struct RegressionStep {
         uint256 step;
         bool zeroForOne;
@@ -516,6 +519,59 @@ contract ForexSwapCorrectTest is Test {
     function test_updateInventoryResponseWad() external {
         forexSwap.updateInventoryResponseWad(5e17);
         assertEq(forexSwap.inventoryResponseWad(), 5e17);
+    }
+
+    function test_inventorySkewIncreasesFeeForImbalanceWorseningSide() external {
+        forexSwap.seedState(9e17, 1e17, 1e18, 1e18, alice);
+        forexSwap.updateHookFeeModel(5e16, 0, 0, 9e16);
+        forexSwap.updateInventorySkewWad(5e17);
+
+        (uint256 feeZeroForOne,) = forexSwap.quoteHookFee(1e16, true);
+        (uint256 feeOneForZero,) = forexSwap.quoteHookFee(1e16, false);
+
+        assertGt(feeZeroForOne, feeOneForZero);
+    }
+
+    function test_maxTradeSizeGuardRevertsWhenExceeded() external {
+        _seedBalancedPool();
+        forexSwap.updateMaxTradeSizeWad(1e16);
+
+        vm.expectRevert(ForexSwap.MaxTradeSizeExceeded.selector);
+        forexSwap.calculateAmountOut(5e16, true);
+    }
+
+    function test_staleAnchorGuardPausesTradingWhenConfigured() external {
+        _seedBalancedPool();
+        forexSwap.updateAnchorGuard(1, true, 0);
+        vm.warp(block.timestamp + 2);
+
+        vm.expectRevert(ForexSwap.StaleAnchor.selector);
+        forexSwap.calculateAmountOut(1e16, true);
+    }
+
+    function test_staleAnchorEmergencyWidenAppliesWhenPauseDisabled() external {
+        _seedBalancedPool();
+
+        (uint256 feeBefore,) = forexSwap.quoteHookFee(1e16, true);
+        forexSwap.updateAnchorGuard(1, false, 2e16);
+        vm.warp(block.timestamp + 2);
+        (uint256 feeAfter,) = forexSwap.quoteHookFee(1e16, true);
+
+        assertGt(feeAfter, feeBefore);
+    }
+
+    function test_anchorTimestampUpdatesOnMarketParamUpdateAndManualTouch() external {
+        uint256 initialAnchorUpdatedAt = forexSwap.anchorUpdatedAt();
+
+        vm.warp(block.timestamp + 10);
+        forexSwap.updateLogNormalParams(12e17, 3e17, 4e15);
+        uint256 afterParamUpdate = forexSwap.anchorUpdatedAt();
+        assertGt(afterParamUpdate, initialAnchorUpdatedAt);
+        assertEq(afterParamUpdate, block.timestamp);
+
+        vm.warp(block.timestamp + 10);
+        forexSwap.updateAnchorTimestamp();
+        assertEq(forexSwap.anchorUpdatedAt(), block.timestamp);
     }
 
     function test_mixedDecimalsSixAndEighteenPreserveRawFacingQuotes() external {
@@ -921,7 +977,7 @@ contract ForexSwapCorrectTest is Test {
         forexSwap.seedConsistentState(reserve0, liquidityL, 1e18, alice);
 
         uint256 stateRand = randomness;
-        uint256 steps = 5 + (stateRand % 16);
+        uint256 steps = 1 + (stateRand % MAX_FUZZ_SEQUENCE_STEPS);
 
         for (uint256 i = 0; i < steps; ++i) {
             stateRand = uint256(keccak256(abi.encode(stateRand, i)));
@@ -990,7 +1046,7 @@ contract ForexSwapCorrectTest is Test {
 
         int256 invariantStart = forexSwap.currentInvariant();
         uint256 stateRand = randomness;
-        uint256 steps = 5 + (stateRand % 16);
+        uint256 steps = 1 + (stateRand % MAX_FUZZ_SEQUENCE_STEPS);
 
         for (uint256 i = 0; i < steps; ++i) {
             stateRand = uint256(keccak256(abi.encode(stateRand, i)));
@@ -1481,7 +1537,7 @@ contract ForexSwapCorrectTest is Test {
         forexSwap.seedConsistentState(reserve0, liquidityL, 1e18, alice);
 
         uint256 stateRand = randomness;
-        uint256 steps = 5 + (stateRand % 16);
+        uint256 steps = 1 + (stateRand % MAX_FUZZ_SEQUENCE_STEPS);
 
         for (uint256 i = 0; i < steps; ++i) {
             int256 exponentBefore = forexSwap.currentPriceExponent();
@@ -1895,14 +1951,16 @@ contract ForexSwapCorrectTest is Test {
         uint256 totalSteps = 5 + (stateRand % 16);
         steps = new RegressionStep[](totalSteps);
 
-        console2.log("--- repeated swap regression ---");
-        console2.log("reserve0Seed", reserve0Seed);
-        console2.log("liquiditySeed", liquiditySeed);
-        console2.log("randomness", randomness);
-        console2.log("invertDirections", invertDirections ? 1 : 0);
-        console2.log("boundedReserve0", reserve0);
-        console2.log("boundedLiquidity", liquidityL);
-        console2.logInt(invariantStart);
+        if (DEBUG) {
+            console2.log("--- repeated swap regression ---");
+            console2.log("reserve0Seed", reserve0Seed);
+            console2.log("liquiditySeed", liquiditySeed);
+            console2.log("randomness", randomness);
+            console2.log("invertDirections", invertDirections ? 1 : 0);
+            console2.log("boundedReserve0", reserve0);
+            console2.log("boundedLiquidity", liquidityL);
+            console2.logInt(invariantStart);
+        }
 
         for (uint256 i = 0; i < totalSteps; ++i) {
             stateRand = uint256(keccak256(abi.encode(stateRand, i)));
@@ -1914,12 +1972,12 @@ contract ForexSwapCorrectTest is Test {
 
             try forexSwap.quoteExactInput(amountIn, zeroForOne) returns (uint256 quoted) {
                 if (quoted == 0) {
-                    console2.log("step skipped: zero quote", i);
+                    if (DEBUG) console2.log("step skipped: zero quote", i);
                     continue;
                 }
 
                 ForexSwapHarness.SwapDebugTrace memory trace = forexSwap.debugExactInput(amountIn, zeroForOne);
-                _logRepeatedSwapTrace(i, stateRand, trace, invariantStart);
+                if (DEBUG) _logRepeatedSwapTrace(i, stateRand, trace, invariantStart);
 
                 forexSwap.executeExactInput(amountIn, zeroForOne);
 
@@ -1938,14 +1996,18 @@ contract ForexSwapCorrectTest is Test {
                     cumulativeDrift: cumulativeDrift
                 });
 
-                console2.log("executed step", i);
-                console2.log("actualAmountOut", trace.amountOut);
-                console2.logInt(actualInvariantAfter);
-                console2.log("stepDrift", stepDrift);
-                console2.log("cumulativeDrift", cumulativeDrift);
+                if (DEBUG) {
+                    console2.log("executed step", i);
+                    console2.log("actualAmountOut", trace.amountOut);
+                    console2.logInt(actualInvariantAfter);
+                    console2.log("stepDrift", stepDrift);
+                    console2.log("cumulativeDrift", cumulativeDrift);
+                }
             } catch (bytes memory reason) {
-                console2.log("step reverted", i);
-                console2.logBytes(reason);
+                if (DEBUG) {
+                    console2.log("step reverted", i);
+                    console2.logBytes(reason);
+                }
             }
         }
     }

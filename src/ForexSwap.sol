@@ -56,16 +56,26 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     error UnsupportedTokenDecimals();
     error TokenDecimalsQueryFailed();
     error InvalidInventoryResponse();
+    error InvalidInventorySkew();
     error BootstrapClipTooLarge();
     error InvalidFeeRecipient();
     error InsufficientAdminFees();
+    error InvalidMaxTradeSize();
+    error MaxTradeSizeExceeded();
+    error InvalidAnchorAge();
+    error InvalidEmergencyWiden();
+    error StaleAnchor();
 
     event MarketParametersUpdated(uint256 newMean, uint256 newWidth, uint256 newBaseHookFeeWad);
     event HookFeeModelUpdated(
         uint256 inventoryFeeScaleWad, uint256 volatilityFeeScaleWad, uint256 tenorFeeScaleWad, uint256 maxHookFeeWad
     );
     event InventoryResponseUpdated(uint256 inventoryResponseWad);
+    event InventorySkewUpdated(uint256 inventorySkewWad);
     event RealizedVolatilityUpdated(uint256 realizedVolatilityWad);
+    event MaxTradeSizeUpdated(uint256 maxTradeSizeWad);
+    event AnchorGuardUpdated(uint256 maxAnchorAgeSeconds, bool emergencyPauseOnStaleAnchor, uint256 emergencyWidenWad);
+    event AnchorTimestampUpdated(uint256 anchorUpdatedAt);
     event LiquidityAdded(address indexed provider, uint256 amount0, uint256 amount1, uint256 shares);
     event LiquidityRemoved(address indexed provider, uint256 amount0, uint256 amount1, uint256 shares);
     event LiquiditySettlementTrace(
@@ -195,6 +205,12 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     uint256 public realizedVolatilityWad;
     PoolState public poolState;
     uint256 public inventoryResponseWad = 25e16;
+    uint256 public inventorySkewWad;
+    uint256 public maxTradeSizeWad;
+    uint256 public maxAnchorAge = 1 days;
+    bool public emergencyPauseOnStaleAnchor = true;
+    uint256 public emergencyWidenWad;
+    uint256 public anchorUpdatedAt;
     uint8 public token0Decimals = 18;
     uint8 public token1Decimals = 18;
     uint256 private token0Scale = 1;
@@ -213,7 +229,9 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     uint256 private pendingAdminFeeAmount;
     bool private pendingAdminFeeSet;
 
-    constructor(IPoolManager _poolManager) BaseHook(_poolManager) Ownable(msg.sender) { }
+    constructor(IPoolManager _poolManager) BaseHook(_poolManager) Ownable(msg.sender) {
+        anchorUpdatedAt = block.timestamp;
+    }
 
     function _beforeInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96)
         internal
@@ -433,8 +451,10 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
         logNormalParams.mean = newMean;
         logNormalParams.width = newWidth;
         logNormalParams.baseHookFeeWad = newBaseHookFeeWad;
+        anchorUpdatedAt = block.timestamp;
 
         emit MarketParametersUpdated(newMean, newWidth, newBaseHookFeeWad);
+        emit AnchorTimestampUpdated(anchorUpdatedAt);
     }
 
     function updateHookFeeModel(
@@ -468,6 +488,42 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
         if (newInventoryResponseWad == 0 || newInventoryResponseWad > WAD) revert InvalidInventoryResponse();
         inventoryResponseWad = newInventoryResponseWad;
         emit InventoryResponseUpdated(newInventoryResponseWad);
+    }
+
+    function updateInventorySkewWad(uint256 newInventorySkewWad) external onlyOwner whenNotPaused {
+        if (newInventorySkewWad > WAD) revert InvalidInventorySkew();
+        inventorySkewWad = newInventorySkewWad;
+        emit InventorySkewUpdated(newInventorySkewWad);
+    }
+
+    function updateMaxTradeSizeWad(uint256 newMaxTradeSizeWad) external onlyOwner whenNotPaused {
+        if (newMaxTradeSizeWad > WAD) revert InvalidMaxTradeSize();
+        maxTradeSizeWad = newMaxTradeSizeWad;
+        emit MaxTradeSizeUpdated(newMaxTradeSizeWad);
+    }
+
+    function updateAnchorGuard(
+        uint256 newMaxAnchorAge,
+        bool newEmergencyPauseOnStaleAnchor,
+        uint256 newEmergencyWidenWad
+    )
+        external
+        onlyOwner
+        whenNotPaused
+    {
+        if (newMaxAnchorAge == 0) revert InvalidAnchorAge();
+        if (newEmergencyWidenWad >= WAD / 10) revert InvalidEmergencyWiden();
+
+        maxAnchorAge = newMaxAnchorAge;
+        emergencyPauseOnStaleAnchor = newEmergencyPauseOnStaleAnchor;
+        emergencyWidenWad = newEmergencyWidenWad;
+
+        emit AnchorGuardUpdated(newMaxAnchorAge, newEmergencyPauseOnStaleAnchor, newEmergencyWidenWad);
+    }
+
+    function updateAnchorTimestamp() external onlyOwner whenNotPaused {
+        anchorUpdatedAt = block.timestamp;
+        emit AnchorTimestampUpdated(anchorUpdatedAt);
     }
 
     function emergencyPause() external onlyOwner {
@@ -574,6 +630,8 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
         returns (uint256 amountOut)
     {
         if (amountIn == 0 || poolState.liquidity == 0) return 0;
+        _requireAnchorFreshForTrading();
+        _requireExactInputTradeWithinLimit(poolState, amountIn, zeroForOne);
         return zeroForOne
             ? _denormalizeAmount1(_quoteExactInput0For1(_normalizeAmount0(amountIn)))
             : _denormalizeAmount0(_quoteExactInput1For0(_normalizeAmount1(amountIn)));
@@ -589,7 +647,9 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
         view
         returns (uint256 hookFeeWad, uint256 hookFeeAmount)
     {
+        _requireAnchorFreshForTrading();
         uint256 normalizedAmountIn = zeroForOne ? _normalizeAmount0(amountIn) : _normalizeAmount1(amountIn);
+        _requireExactInputTradeWithinLimit(poolState, normalizedAmountIn, zeroForOne);
         hookFeeWad = _computeHookFeeWad(poolState, normalizedAmountIn, zeroForOne);
         uint256 normalizedFeeAmount = FullMath.mulDiv(normalizedAmountIn, hookFeeWad, WAD);
         hookFeeAmount = zeroForOne ? _denormalizeAmount0(normalizedFeeAmount) : _denormalizeAmount1(normalizedFeeAmount);
@@ -830,6 +890,8 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
 
     function _executeExactInput0For1(uint256 amountIn) internal returns (uint256 amountOut) {
         PoolState memory state = poolState;
+        _requireAnchorFreshForTrading();
+        _requireExactInputTradeWithinLimit(state, amountIn, true);
         uint256 hookFeeWad = _computeHookFeeWad(state, amountIn, true);
         uint256 feeAmount = FullMath.mulDiv(amountIn, hookFeeWad, WAD);
         uint256 effectiveIn = amountIn - feeAmount;
@@ -860,6 +922,8 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
 
     function _executeExactInput1For0(uint256 amountIn) internal returns (uint256 amountOut) {
         PoolState memory state = poolState;
+        _requireAnchorFreshForTrading();
+        _requireExactInputTradeWithinLimit(state, amountIn, false);
         uint256 hookFeeWad = _computeHookFeeWad(state, amountIn, false);
         uint256 feeAmount = FullMath.mulDiv(amountIn, hookFeeWad, WAD);
         uint256 effectiveIn = amountIn - feeAmount;
@@ -901,6 +965,8 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     function _solveExactInput0For1(uint256 targetOut) internal view returns (uint256 amountIn) {
         PoolState memory state = poolState;
         if (targetOut == 0 || targetOut >= state.reserve1) revert InsufficientLiquidity();
+        _requireAnchorFreshForTrading();
+        _requireExactOutputTradeWithinLimit(state, targetOut, true);
 
         return _solveLeastExactInput(targetOut, Math.max(state.reserve0, 1e6), state.liquidity * 4, true);
     }
@@ -908,6 +974,8 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     function _solveExactInput1For0(uint256 targetOut) internal view returns (uint256 amountIn) {
         PoolState memory state = poolState;
         if (targetOut == 0 || targetOut >= state.reserve0) revert InsufficientLiquidity();
+        _requireAnchorFreshForTrading();
+        _requireExactOutputTradeWithinLimit(state, targetOut, false);
 
         // solhint-disable-next-line max-line-length
         return _solveLeastExactInput(targetOut, Math.max(state.reserve1, 1e6), _maxReserve1(state.liquidity) * 4, false);
@@ -916,6 +984,8 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     function _quoteExactInput0For1(uint256 amountIn) internal view returns (uint256 amountOut) {
         PoolState memory state = poolState;
         if (state.liquidity == 0 || amountIn == 0) return 0;
+        _requireAnchorFreshForTrading();
+        _requireExactInputTradeWithinLimit(state, amountIn, true);
 
         uint256 feeAmount = FullMath.mulDiv(amountIn, _computeHookFeeWad(state, amountIn, true), WAD);
         uint256 effectiveIn = amountIn - feeAmount;
@@ -933,6 +1003,8 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     function _quoteExactInput1For0(uint256 amountIn) internal view returns (uint256 amountOut) {
         PoolState memory state = poolState;
         if (state.liquidity == 0 || amountIn == 0) return 0;
+        _requireAnchorFreshForTrading();
+        _requireExactInputTradeWithinLimit(state, amountIn, false);
 
         uint256 feeAmount = FullMath.mulDiv(amountIn, _computeHookFeeWad(state, amountIn, false), WAD);
         uint256 effectiveIn = amountIn - feeAmount;
@@ -962,6 +1034,7 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
         hookFeeWad += _inventoryFeeWad(state, zeroForOne);
         hookFeeWad += _volatilityFeeWad();
         hookFeeWad += _tenorFeeWad();
+        if (_isAnchorStale()) hookFeeWad += emergencyWidenWad;
 
         uint256 maxHookFeeWad = hookFeeModel.maxHookFeeWad;
         if (hookFeeWad > maxHookFeeWad) hookFeeWad = maxHookFeeWad;
@@ -988,7 +1061,6 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
     }
 
     function _inventoryFeeWad(PoolState memory state, bool zeroForOne) internal view virtual returns (uint256) {
-        zeroForOne;
         uint256 scale = hookFeeModel.inventoryFeeScaleWad;
         if (scale == 0 || state.liquidity == 0) return 0;
 
@@ -1000,7 +1072,15 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
             ? reserve0ValueInToken1 - state.reserve1
             : state.reserve1 - reserve0ValueInToken1;
         uint256 imbalanceWad = FullMath.mulDiv(imbalance, WAD, totalValueInToken1);
-        return FullMath.mulDiv(imbalanceWad, scale, WAD);
+        uint256 inventoryFee = FullMath.mulDiv(imbalanceWad, scale, WAD);
+
+        bool reserve0Heavy = reserve0ValueInToken1 >= state.reserve1;
+        bool worsensImbalance = zeroForOne ? reserve0Heavy : !reserve0Heavy;
+        if (worsensImbalance && inventorySkewWad > 0) {
+            inventoryFee += FullMath.mulDiv(inventoryFee, inventorySkewWad, WAD);
+        }
+
+        return inventoryFee;
     }
 
     function _volatilityFeeWad() internal view virtual returns (uint256) {
@@ -1336,6 +1416,29 @@ contract ForexSwap is BaseCustomCurve, Ownable, Pausable, ReentrancyGuard {
 
     function _ceilDiv(uint256 numerator, uint256 denominator) internal pure returns (uint256) {
         return numerator == 0 ? 0 : ((numerator - 1) / denominator) + 1;
+    }
+
+    function _isAnchorStale() internal view returns (bool) {
+        return block.timestamp > anchorUpdatedAt + maxAnchorAge;
+    }
+
+    function _requireAnchorFreshForTrading() internal view {
+        if (emergencyPauseOnStaleAnchor && _isAnchorStale()) revert StaleAnchor();
+    }
+
+    function _requireExactInputTradeWithinLimit(PoolState memory state, uint256 amountIn, bool zeroForOne) internal view {
+        if (maxTradeSizeWad == 0) return;
+        uint256 reserveIn = zeroForOne ? state.reserve0 : state.reserve1;
+        if (amountIn > FullMath.mulDiv(reserveIn, maxTradeSizeWad, WAD)) revert MaxTradeSizeExceeded();
+    }
+
+    function _requireExactOutputTradeWithinLimit(PoolState memory state, uint256 amountOut, bool zeroForOne)
+        internal
+        view
+    {
+        if (maxTradeSizeWad == 0) return;
+        uint256 reserveOut = zeroForOne ? state.reserve1 : state.reserve0;
+        if (amountOut > FullMath.mulDiv(reserveOut, maxTradeSizeWad, WAD)) revert MaxTradeSizeExceeded();
     }
 
     function _modifyLiquidity(bytes memory params)
