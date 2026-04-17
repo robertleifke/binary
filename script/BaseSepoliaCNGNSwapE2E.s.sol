@@ -62,7 +62,8 @@ contract BaseSepoliaCNGNSwapE2E is BaseScript {
     address internal constant BASE_SEPOLIA_USDC = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
     address internal constant BASE_SEPOLIA_CNGN = 0xe2387F04d3858e7Cb64Ef5Ed6617f9B2fcEEAfa2;
     uint160 internal constant REQUIRED_HOOK_FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-        | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG;
+        | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+        | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
     uint256 internal constant WAD = 1e18;
     uint256 internal constant BASELINE_FEE_WAD = 3e15;
     uint256 internal constant DEFAULT_INVENTORY_RESPONSE_WAD = 25e16;
@@ -76,8 +77,9 @@ contract BaseSepoliaCNGNSwapE2E is BaseScript {
     uint256 internal constant DEFAULT_SELL_MEDIUM = 5_000_000;
     uint256 internal constant DEFAULT_SELL_LARGE = 10_000_000;
     int24 internal constant TICK_SPACING = 60;
-    int24 internal constant TICK_LOWER = -120;
-    int24 internal constant TICK_UPPER = 120;
+    // BaseCustomAccounting integration in this repo uses the canonical full-range sentinel ticks (0, 0).
+    int24 internal constant TICK_LOWER = 0;
+    int24 internal constant TICK_UPPER = 0;
 
     function run() public broadcast returns (ForexSwap hook) {
         RunState memory s;
@@ -96,6 +98,10 @@ contract BaseSepoliaCNGNSwapE2E is BaseScript {
         uint256 sellSmall = vm.envOr("SELL_SMALL", DEFAULT_SELL_SMALL);
         uint256 sellMedium = vm.envOr("SELL_MEDIUM", DEFAULT_SELL_MEDIUM);
         uint256 sellLarge = vm.envOr("SELL_LARGE", DEFAULT_SELL_LARGE);
+        address existingHookAddress = vm.envOr("EXISTING_HOOK", address(0));
+        bool useExistingHook = vm.envOr("USE_EXISTING_HOOK", false) || existingHookAddress != address(0);
+        bool skipAdminUpdates = vm.envOr("SKIP_ADMIN_UPDATES", useExistingHook);
+        bool forceInitializePool = vm.envOr("FORCE_INITIALIZE_POOL", false);
 
         _requireBalances(
             s.usdc, s.cngn, s.amount0Desired, s.amount1Desired, buySmall, buyMedium, buyLarge, sellSmall, sellMedium, sellLarge
@@ -105,9 +111,21 @@ contract BaseSepoliaCNGNSwapE2E is BaseScript {
         require(Currency.unwrap(currency0) == BASE_SEPOLIA_USDC, "unexpected currency0");
         require(Currency.unwrap(currency1) == BASE_SEPOLIA_CNGN, "unexpected currency1");
 
-        (s.hook, s.factory, s.salt, s.predictedHook) = _deployHook(s.poolManager);
-        _anchorHookMean(s.hook, s.cngnPerUsdcWad);
-        _tuneInventoryResponse(s.hook);
+        if (useExistingHook) {
+            require(existingHookAddress != address(0), "EXISTING_HOOK required");
+            s.hook = ForexSwap(existingHookAddress);
+            s.predictedHook = existingHookAddress;
+        } else {
+            (s.hook, s.factory, s.salt, s.predictedHook) = _deployHook(s.poolManager);
+        }
+
+        if (!skipAdminUpdates) {
+            _anchorHookMean(s.hook, s.cngnPerUsdcWad);
+            _tuneInventoryResponse(s.hook);
+        } else {
+            console.log("Skipping admin updates (anchor/inventory tuning)");
+        }
+
         s.key = PoolKey({
             currency0: currency0,
             currency1: currency1,
@@ -116,7 +134,7 @@ contract BaseSepoliaCNGNSwapE2E is BaseScript {
             hooks: IHooks(address(s.hook))
         });
 
-        s.poolManager.initialize(s.key, s.sqrtPriceX96);
+        _initializePoolIfNeeded(s.poolManager, s.key, s.sqrtPriceX96, forceInitializePool);
 
         uint256 deadline = block.timestamp + 1 hours;
         (uint256 amount0, uint256 amount1, uint256 shares) =
@@ -208,6 +226,21 @@ contract BaseSepoliaCNGNSwapE2E is BaseScript {
     function _tuneInventoryResponse(ForexSwap hook) internal {
         uint256 responseWad = vm.envOr("INVENTORY_RESPONSE_WAD", DEFAULT_INVENTORY_RESPONSE_WAD);
         hook.updateInventoryResponseWad(responseWad);
+    }
+
+    function _initializePoolIfNeeded(IPoolManager poolManager, PoolKey memory key, uint160 sqrtPriceX96, bool forceInitialize)
+        internal
+    {
+        if (forceInitialize) {
+            poolManager.initialize(key, sqrtPriceX96);
+            return;
+        }
+
+        try poolManager.initialize(key, sqrtPriceX96) {
+            console.log("Pool initialized");
+        } catch {
+            console.log("Pool initialize skipped (already initialized or invalid)");
+        }
     }
 
     function _logSwapScenario(
